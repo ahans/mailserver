@@ -30,6 +30,7 @@ DOMAIN=${DOMAIN:-$(hostname --domain)}
 VMAILUID=${VMAILUID:-1024}
 VMAILGID=${VMAILGID:-1024}
 VMAIL_SUBDIR=${VMAIL_SUBDIR:-"mail"}
+DEBUG_MODE=${DEBUG_MODE:-false}
 DBDRIVER=${DBDRIVER:-mysql}
 DBHOST=${DBHOST:-mariadb}
 DBPORT=${DBPORT:-3306}
@@ -47,7 +48,7 @@ DISABLE_CLAMAV=${DISABLE_CLAMAV:-false}
 DISABLE_SIEVE=${DISABLE_SIEVE:-false}
 DISABLE_SIGNING=${DISABLE_SIGNING:-false}
 DISABLE_GREYLISTING=${DISABLE_GREYLISTING:-false}
-DISABLE_RATELIMITING=${DISABLE_RATELIMITING:-false}
+DISABLE_RATELIMITING=${DISABLE_RATELIMITING:-true}
 DISABLE_DNS_RESOLVER=${DISABLE_DNS_RESOLVER:-false}
 ENABLE_POP3=${ENABLE_POP3:-false}
 ENABLE_FETCHMAIL=${ENABLE_FETCHMAIL:-false}
@@ -94,6 +95,7 @@ ACME_FILE="$ACME_PATH"/acme.json
 ACME_DUMP="$ACME_PATH"/dump.log
 CERT_TEMP_PATH=/tmp/ssl
 LETS_ENCRYPT_LIVE_PATH=/etc/letsencrypt/live/"$FQDN"
+RENEWED_CERTIFICATE=false
 
 if [ -f "$ACME_FILE" ]; then
 
@@ -130,10 +132,12 @@ if [ -f "$ACME_FILE" ]; then
     mv -f "$CERT_TEMP_PATH"/certs/"$FQDN".crt "$LETS_ENCRYPT_LIVE_PATH"/fullchain.pem
     mv -f "$CERT_TEMP_PATH"/private/"$FQDN".key "$LETS_ENCRYPT_LIVE_PATH"/privkey.pem
     rm -rf "$CERT_TEMP_PATH" "$ACME_DUMP"
+    RENEWED_CERTIFICATE=true
   elif [ -e "$CERT_TEMP_PATH"/certs/"$DOMAIN".crt ] && [ -e "$CERT_TEMP_PATH"/private/"$DOMAIN".key ]; then
     mv -f "$CERT_TEMP_PATH"/certs/"$DOMAIN".crt "$LETS_ENCRYPT_LIVE_PATH"/fullchain.pem
     mv -f "$CERT_TEMP_PATH"/private/"$DOMAIN".key "$LETS_ENCRYPT_LIVE_PATH"/privkey.pem
     rm -rf "$CERT_TEMP_PATH" "$ACME_DUMP"
+    RENEWED_CERTIFICATE=true
   else
     echo "[ERROR] The certificate for ${FQDN} or the private key was not found !"
     echo "[INFO] Don't forget to add a new traefik frontend rule to generate a certificate for ${FQDN} subdomain"
@@ -165,7 +169,7 @@ if [ -d "$LETS_ENCRYPT_LIVE_PATH" ]; then
     exit 1
   fi
 
-  if [ ! -e "$CAFILE" ] || [ ! -e "$CERTFILE" ]; then
+  if [ "$RENEWED_CERTIFICATE" = true ] || [ ! -e "$CAFILE" ] || [ ! -e "$CERTFILE" ]; then
     if [ ! -e "$FULLCHAIN" ]; then
       echo "[ERROR] No fullchain found in $LETS_ENCRYPT_LIVE_PATH !"
       exit 1
@@ -284,8 +288,21 @@ if [ -f /var/mail/postfix/custom.conf ]; then
   # Ignore blank lines and comments
   sed -e '/^\s*$/d' -e '/^#/d' /var/mail/postfix/custom.conf | \
   while read line; do
-    echo "[INFO] Override : ${line}"
-    postconf -e "$line"
+    type=${line:0:2}
+    value=${line:2}
+    if [[ "$type" == 'S|' ]]; then
+      postconf -M "$value"
+      echo "[INFO] Override service entry in master.cf : ${value}"
+    elif [[ "$type" == 'F|' ]]; then
+      postconf -F "$value"
+      echo "[INFO] Override service field in master.cf : ${value}"
+    elif [[ "$type" == 'P|' ]]; then
+      postconf -P "$value"
+      echo "[INFO] Override service parameter in master.cf : ${value}"
+    else
+      echo "[INFO] Override parameter in main.cf : ${line}"
+      postconf -e "$line"
+    fi
   done
   echo "[INFO] Custom Postfix configuration file loaded"
 fi
@@ -346,6 +363,29 @@ sed -i -e "s/DOVECOT_MIN_PROCESS/${DOVECOT_MIN_PROCESS}/" \
 # ENABLE / DISABLE MAIL SERVER FEATURES
 # ---------------------------------------------------------------------------------------------
 
+# Enable Postfix, Dovecot and Rspamd verbose logging
+if [ "$DEBUG_MODE" != false ]; then
+  if [[ "$DEBUG_MODE" = *"postfix"* || "$DEBUG_MODE" = true ]]; then
+    echo "[INFO] Postfix debug mode is enabled"
+    sed -i '/^s.*inet/ s/$/ -v/' /etc/postfix/master.cf
+  fi
+  if [[ "$DEBUG_MODE" = *"dovecot"* || "$DEBUG_MODE" = true ]]; then
+    echo "[INFO] Dovecot debug mode is enabled"
+    sed -i 's/^#//g' /etc/dovecot/conf.d/10-logging.conf
+  fi
+  if [[ "$DEBUG_MODE" = *"rspamd"* || "$DEBUG_MODE" = true ]]; then
+    echo "[INFO] Rspamd debug mode is enabled"
+    sed -i 's/warning/info/g' /etc/rspamd/local.d/logging.inc
+  fi
+  if [[ "$DEBUG_MODE" = *"Unbound"* || "$DEBUG_MODE" = true ]]; then
+    echo "[INFO] Unbound debug mode is enabled"
+    sed -i -e 's/verbosity: 0/verbosity: 2/g' \
+           -e 's/logfile: \/dev\/null/logfile: ""/g' /etc/unbound/unbound.conf
+  fi
+else
+  echo "[INFO] Debug mode is disabled"
+fi
+
 # Disable virus check if asked
 if [ "$DISABLE_CLAMAV" = true ]; then
   echo "[INFO] ClamAV is disabled, service will not start"
@@ -359,7 +399,27 @@ if [ "$ENABLE_FETCHMAIL" = false ]; then
   echo "[INFO] Fetchmail forwarding is disabled"
   rm -f /etc/cron.d/fetchmail
 else
-  echo "[INFO] Fetchmail forwarding is enabled"
+
+echo "[INFO] Fetchmail forwarding is enabled"
+
+if [ "$TESTING" = true ]; then
+  rm -f /etc/cron.d/fetchmail
+fi
+
+# Fetchmail dedicated port (10025) with less restrictions
+# https://github.com/hardware/mailserver/issues/276
+cat >> /etc/postfix/master.cf <<EOF
+127.0.0.1:10025 inet  n       -       -       -       10      smtpd
+  -o content_filter=
+  -o receive_override_options=no_unknown_recipient_checks,no_header_body_checks,no_milters
+  -o smtpd_helo_restrictions=
+  -o smtpd_client_restrictions=
+  -o smtpd_sender_restrictions=
+  -o smtpd_recipient_restrictions=permit_mynetworks,reject
+  -o mynetworks=127.0.0.0/8,[::1]/128
+  -o smtpd_authorized_xforward_hosts=127.0.0.0/8,[::1]/128
+EOF
+
 fi
 
 # Disable automatic GPG encryption
@@ -478,6 +538,14 @@ cp -f /etc/localtime /var/mail/postfix/spool/etc/localtime
 # Build header_checks and virtual index files
 postmap /etc/postfix/header_checks
 postmap /etc/postfix/virtual
+
+if [ -s "/var/mail/postfix/sender_access" ]; then
+  echo "[INFO] sender_access file found, sender access check enabled"
+  cp /var/mail/postfix/sender_access /etc/postfix/sender_access
+  postmap /etc/postfix/sender_access
+else
+  sed -i '/check_sender_access/ s/^/#/' /etc/postfix/main.cf
+fi
 
 # Set permissions
 chgrp -R postdrop /var/mail/postfix/spool/public
@@ -606,7 +674,19 @@ adduser --quiet \
         _rspamd
 
 # Setting the controller password
-PASSWORD=$(rspamadm pw --quiet --encrypt --type pbkdf2 --password "${RSPAMD_PASSWORD}")
+PASSWORD=$(rspamadm pw --quiet --encrypt --type pbkdf2 --password "${RSPAMD_PASSWORD}" | grep -v SSSE3)
+if ! grep --quiet 'ssse3' /proc/cpuinfo; then
+  if ! grep --quiet 'disable_hyperscan' /etc/rspamd/local.d/options.inc; then
+    echo "disable_hyperscan = true;" >> /etc/rspamd/local.d/options.inc
+  fi
+  echo "[INFO] Missing SSSE3 CPU instructions, hyperscan is disabled"
+fi
+
+if [ -z "$PASSWORD" ]; then
+  echo "[ERROR] rspamadm pw : bad output"
+  exit 1
+fi
+
 sed -i "s|<PASSWORD>|${PASSWORD}|g" /etc/rspamd/local.d/worker-controller.inc
 
 # Set permissions
@@ -635,12 +715,10 @@ for address in "${whitelist[@]}"; do
 done
 
 cat > /etc/rspamd/local.d/settings.conf <<EOF
-settings {
-  whitelist {
-    priority = low;
-    rcpt = [${rcpts::-1}];
-    want_spam = yes;
-  }
+whitelist {
+  priority = low;
+  rcpt = [${rcpts::-1}];
+  want_spam = yes;
 }
 EOF
 
@@ -665,8 +743,8 @@ sed -i '/^DatabaseMirror/ d' /etc/clamav/freshclam.conf
 
 # Add some database mirrors
 cat <<EOT >> /etc/clamav/freshclam.conf
+DatabaseMirror db.local.clamav.net
 DatabaseMirror switch.clamav.net
-DatabaseMirror clamav.iol.cz
 DatabaseMirror clamav.easynet.fr
 DatabaseMirror clamav.begi.net
 DatabaseMirror clamav.univ-nantes.fr
